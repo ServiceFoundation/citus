@@ -82,7 +82,8 @@ static void AcquireMetadataLocks(List *taskList);
 static ShardPlacementAccess * CreatePlacementAccess(ShardPlacement *placement,
 													ShardPlacementAccessType accessType);
 static int64 ExecuteSingleModifyTask(CitusScanState *scanState, Task *task,
-									 bool multipleTasks, bool expectResults);
+									 bool failOnError, bool expectResults);
+static bool TaskRequires2PC(List *taskList);
 static void ExecuteSingleSelectTask(CitusScanState *scanState, Task *task);
 static List * GetModifyConnections(Task *task, bool markCritical);
 static void ExecuteMultipleTasks(CitusScanState *scanState, List *taskList,
@@ -475,6 +476,7 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 		List *taskList = workerJob->taskList;
 		ListCell *taskCell = NULL;
 		bool multipleTasks = list_length(taskList) > 1;
+		bool failOnError = false;
 		EState *executorState = scanState->customScanState.ss.ps.state;
 
 		/*
@@ -483,9 +485,34 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 		 * customers already use functions that touch multiple shards from within
 		 * a function, so we'll ignore functions for now.
 		 */
-		if (IsTransactionBlock() || multipleTasks)
+		if (IsTransactionBlock())
 		{
 			BeginOrContinueCoordinatedTransaction();
+		}
+
+		if (multipleTasks)
+		{
+			BeginOrContinueCoordinatedTransaction();
+
+			if (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC)
+			{
+				/* use 2PC for multi-shard transactions when enabled */
+				CoordinatedTransactionUse2PC();
+				failOnError = true;
+			}
+			else if (hasReturning)
+			{
+				/* cannot handle failures when there is RETURNING */
+				failOnError = true;
+			}
+		}
+
+		/* we always perform writes to a reference table in a 2PC */
+		if (TaskRequires2PC(taskList))
+		{
+			BeginOrContinueCoordinatedTransaction();
+			CoordinatedTransactionUse2PC();
+			failOnError = true;
 		}
 
 		ExecuteSubPlans(distributedPlan);
@@ -495,7 +522,7 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 			Task *task = (Task *) lfirst(taskCell);
 
 			executorState->es_processed +=
-				ExecuteSingleModifyTask(scanState, task, multipleTasks, hasReturning);
+				ExecuteSingleModifyTask(scanState, task, failOnError, hasReturning);
 		}
 
 		scanState->finishedRemoteScan = true;
@@ -504,6 +531,30 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 	resultSlot = ReturnTupleFromTuplestore(scanState);
 
 	return resultSlot;
+}
+
+
+/*
+ * TaskRequires2PC determines whether the given task list requires 2PC
+ * because it writes to a reference table.
+ */
+static bool
+TaskRequires2PC(List *taskList)
+{
+	Task *task = NULL;
+
+	if (taskList == NIL)
+	{
+		return false;
+	}
+
+	task = (Task *) linitial(taskList);
+	if (task->replicationModel == REPLICATION_MODEL_2PC)
+	{
+		return true;
+	}
+
+	return false;
 }
 
 
@@ -742,7 +793,7 @@ CreatePlacementAccess(ShardPlacement *placement, ShardPlacementAccessType access
  * The function returns affectedTupleCount if applicable.
  */
 static int64
-ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTasks,
+ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool failOnError,
 						bool expectResults)
 {
 	CmdType operation = CMD_UNKNOWN;
@@ -758,22 +809,9 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	bool gotResults = false;
 
 	char *queryString = task->queryString;
-	bool taskRequiresTwoPhaseCommit = (task->replicationModel == REPLICATION_MODEL_2PC);
-	bool failOnError = false;
 
 	ShardInterval *shardInterval = LoadShardInterval(task->anchorShardId);
 	Oid relationId = shardInterval->relationId;
-
-	if (multipleTasks)
-	{
-		taskRequiresTwoPhaseCommit |= (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC);
-	}
-
-	/* we don't allow failures to happen with CREATE INDEX CONCURRENTLY */
-	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_BARE)
-	{
-		failOnError = true;
-	}
 
 	if (scanState)
 	{
@@ -783,24 +821,12 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	}
 
 	/*
-	 * Modifications for reference tables are always done using 2PC. First
-	 * ensure that distributed transaction is started. Then force the
-	 * transaction manager to use 2PC while running the task on the
-	 * placements.
-	 */
-	if (taskRequiresTwoPhaseCommit)
-	{
-		BeginOrContinueCoordinatedTransaction();
-		CoordinatedTransactionUse2PC();
-	}
-
-	/*
 	 * Get connections required to execute task. This will, if necessary,
 	 * establish the connection, mark as critical (when modifying reference
 	 * table or multi-shard command) and start a transaction (when in a
 	 * transaction).
 	 */
-	connectionList = GetModifyConnections(task, taskRequiresTwoPhaseCommit);
+	connectionList = GetModifyConnections(task, failOnError);
 
 	/*
 	 * If we are dealing with a partitioned table, we also need to lock its
@@ -846,18 +872,6 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		{
 			failureCount++;
 			continue;
-		}
-
-		/* if we're running a 2PC, the query should fail on error */
-		failOnError |= taskRequiresTwoPhaseCommit;
-
-		if (multipleTasks && expectResults)
-		{
-			/*
-			 * If we have multiple tasks and one fails, we cannot clear
-			 * the tuple store and start over. Error out instead.
-			 */
-			failOnError = true;
 		}
 
 		if (failureCount + 1 == list_length(taskPlacementList))
@@ -1074,7 +1088,7 @@ int64
 ExecuteModifyTasksSequentiallyWithoutResults(List *taskList)
 {
 	ListCell *taskCell = NULL;
-	bool multipleTasks = list_length(taskList) > 1;
+	bool failOnError = true;
 	bool expectResults = false;
 	int64 affectedTupleCount = 0;
 
@@ -1083,7 +1097,7 @@ ExecuteModifyTasksSequentiallyWithoutResults(List *taskList)
 		Task *task = (Task *) lfirst(taskCell);
 
 		affectedTupleCount +=
-			ExecuteSingleModifyTask(NULL, task, multipleTasks, expectResults);
+			ExecuteSingleModifyTask(NULL, task, failOnError, expectResults);
 	}
 
 	return affectedTupleCount;
