@@ -728,7 +728,9 @@ CreatePlacementAccess(ShardPlacement *placement, ShardPlacementAccessType access
 
 /*
  * ExecuteSingleModifyTask executes the task on the remote node, retrieves the
- * results and stores them, if RETURNING is used, in a tuple store.
+ * results and stores them, if RETURNING is used, in a tuple store. The function
+ * can execute both DDL and DML tasks. When a DDL task is passed, the function
+ * does not expect scanState to be present.
  *
  * If the task fails on one of the placements, the function reraises the
  * remote error (constraint violation in DML), marks the affected placement as
@@ -739,9 +741,9 @@ static void
 ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTasks,
 						bool expectResults)
 {
-	CmdType operation = scanState->distributedPlan->operation;
-	EState *executorState = scanState->customScanState.ss.ps.state;
-	ParamListInfo paramListInfo = executorState->es_param_list_info;
+	CmdType operation = CMD_UNKNOWN;
+	EState *executorState = NULL;
+	ParamListInfo paramListInfo = NULL;
 	List *taskPlacementList = task->taskPlacementList;
 	List *connectionList = NIL;
 	ListCell *taskPlacementCell = NULL;
@@ -753,9 +755,28 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 
 	char *queryString = task->queryString;
 	bool taskRequiresTwoPhaseCommit = (task->replicationModel == REPLICATION_MODEL_2PC);
+	bool failOnError = false;
 
 	ShardInterval *shardInterval = LoadShardInterval(task->anchorShardId);
 	Oid relationId = shardInterval->relationId;
+
+	if (multipleTasks)
+	{
+		taskRequiresTwoPhaseCommit |= (MultiShardCommitProtocol == COMMIT_PROTOCOL_2PC);
+	}
+
+	/* we don't allow failures to happen with CREATE INDEX CONCURRENTLY */
+	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_BARE)
+	{
+		failOnError = true;
+	}
+
+	if (task->taskType == MODIFY_TASK)
+	{
+		operation = scanState->distributedPlan->operation;
+		executorState = scanState->customScanState.ss.ps.state;
+		paramListInfo = executorState->es_param_list_info;
+	}
 
 	/*
 	 * Modifications for reference tables are always done using 2PC. First
@@ -772,7 +793,8 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	/*
 	 * Get connections required to execute task. This will, if necessary,
 	 * establish the connection, mark as critical (when modifying reference
-	 * table) and start a transaction (when in a transaction).
+	 * table or multi-shard command) and start a transaction (when in a
+	 * transaction).
 	 */
 	connectionList = GetModifyConnections(task, taskRequiresTwoPhaseCommit);
 
@@ -788,8 +810,11 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		LockPartitionRelations(relationId, RowExclusiveLock);
 	}
 
-	/* prevent replicas of the same shard from diverging */
-	AcquireExecutorShardLock(task, operation);
+	if (task->taskType == MODIFY_TASK)
+	{
+		/* prevent replicas of the same shard from diverging */
+		AcquireExecutorShardLock(task, operation);
+	}
 
 	/* try to execute modification on all placements */
 	forboth(taskPlacementCell, taskPlacementList, connectionCell, connectionList)
@@ -797,7 +822,6 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		ShardPlacement *taskPlacement = (ShardPlacement *) lfirst(taskPlacementCell);
 		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
 		bool queryOK = false;
-		bool failOnError = false;
 		int64 currentAffectedTupleCount = 0;
 
 		if (connection->remoteTransaction.transactionFailed)
@@ -821,7 +845,7 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		}
 
 		/* if we're running a 2PC, the query should fail on error */
-		failOnError = taskRequiresTwoPhaseCommit;
+		failOnError |= taskRequiresTwoPhaseCommit;
 
 		if (multipleTasks && expectResults)
 		{
@@ -848,6 +872,9 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		 */
 		if (!gotResults && expectResults)
 		{
+			/* DDL tasks don't need to store any results */
+			Assert(task->taskType != DDL_TASK);
+
 			queryOK = StoreQueryResult(scanState, connection, failOnError,
 									   &currentAffectedTupleCount, NULL);
 		}
@@ -897,7 +924,10 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	/* if some placements failed, ensure future statements don't access them */
 	MarkFailedShardPlacements();
 
-	executorState->es_processed += affectedTupleCount;
+	if (executorState)
+	{
+		executorState->es_processed += affectedTupleCount;
+	}
 
 	if (IsTransactionBlock())
 	{
@@ -925,10 +955,22 @@ GetModifyConnections(Task *task, bool markCritical)
 	foreach(taskPlacementCell, taskPlacementList)
 	{
 		ShardPlacement *taskPlacement = (ShardPlacement *) lfirst(taskPlacementCell);
-		int connectionFlags = SESSION_LIFESPAN | FOR_DML;
+		int connectionFlags = SESSION_LIFESPAN;
 		MultiConnection *multiConnection = NULL;
 		List *placementAccessList = NIL;
 		ShardPlacementAccess *placementModification = NULL;
+		ShardPlacementAccessType accessType = PLACEMENT_ACCESS_DML;
+
+		if (task->taskType == DDL_TASK)
+		{
+			connectionFlags = connectionFlags | FOR_DDL;
+			accessType = PLACEMENT_ACCESS_DDL;
+		}
+		else
+		{
+			connectionFlags = connectionFlags | FOR_DML;
+			accessType = PLACEMENT_ACCESS_DML;
+		}
 
 		/* create placement accesses for placements that appear in a subselect */
 		placementAccessList = BuildPlacementSelectList(taskPlacement->groupId,
@@ -937,8 +979,7 @@ GetModifyConnections(Task *task, bool markCritical)
 		Assert(list_length(placementAccessList) == list_length(relationShardList));
 
 		/* create placement access for the placement that we're modifying */
-		placementModification = CreatePlacementAccess(taskPlacement,
-													  PLACEMENT_ACCESS_DML);
+		placementModification = CreatePlacementAccess(taskPlacement, accessType);
 		placementAccessList = lappend(placementAccessList, placementModification);
 
 		/* get an appropriate connection for the DML statement */
@@ -1019,22 +1060,24 @@ ExecuteModifyTasksWithoutResults(List *taskList)
 
 
 /*
- * ExecuteTasksSequentiallyWithoutResults basically calls ExecuteModifyTasks in
+ * ExecuteDDLTasksSequentiallyWithoutResults basically calls ExecuteSingleModifyTask in
  * a loop in order to simulate sequential execution of a list of tasks. Useful
  * in cases where issuing commands in parallel before waiting for results could
- * result in deadlocks (such as CREATE INDEX CONCURRENTLY).
+ * result in deadlocks (such as CREATE INDEX CONCURRENTLY or foreign key creation to
+ * reference tables).
  */
 void
-ExecuteTasksSequentiallyWithoutResults(List *taskList)
+ExecuteDDLTasksSequentiallyWithoutResults(List *taskList)
 {
 	ListCell *taskCell = NULL;
+	bool multipleTasks = list_length(taskList) > 1;
+	bool expectResults = false;
 
 	foreach(taskCell, taskList)
 	{
 		Task *task = (Task *) lfirst(taskCell);
-		List *singleTask = list_make1(task);
 
-		ExecuteModifyTasksWithoutResults(singleTask);
+		ExecuteSingleModifyTask(NULL, task, multipleTasks, expectResults);
 	}
 }
 
