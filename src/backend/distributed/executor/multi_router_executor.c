@@ -81,8 +81,8 @@ bool EnableDeadlockPrevention = true;
 static void AcquireMetadataLocks(List *taskList);
 static ShardPlacementAccess * CreatePlacementAccess(ShardPlacement *placement,
 													ShardPlacementAccessType accessType);
-static void ExecuteSingleModifyTask(CitusScanState *scanState, Task *task,
-									bool multipleTasks, bool expectResults);
+static int64 ExecuteSingleModifyTask(CitusScanState *scanState, Task *task,
+									 bool multipleTasks, bool expectResults);
 static void ExecuteSingleSelectTask(CitusScanState *scanState, Task *task);
 static List * GetModifyConnections(Task *task, bool markCritical);
 static void ExecuteMultipleTasks(CitusScanState *scanState, List *taskList,
@@ -475,6 +475,7 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 		List *taskList = workerJob->taskList;
 		ListCell *taskCell = NULL;
 		bool multipleTasks = list_length(taskList) > 1;
+		EState *executorState = scanState->customScanState.ss.ps.state;
 
 		/*
 		 * We could naturally handle function-based transactions (i.e. those using
@@ -493,7 +494,8 @@ RouterSequentialModifyExecScan(CustomScanState *node)
 		{
 			Task *task = (Task *) lfirst(taskCell);
 
-			ExecuteSingleModifyTask(scanState, task, multipleTasks, hasReturning);
+			executorState->es_processed +=
+				ExecuteSingleModifyTask(scanState, task, multipleTasks, hasReturning);
 		}
 
 		scanState->finishedRemoteScan = true;
@@ -736,8 +738,10 @@ CreatePlacementAccess(ShardPlacement *placement, ShardPlacementAccessType access
  * remote error (constraint violation in DML), marks the affected placement as
  * invalid (other error on some placements, via the placement connection
  * framework), or errors out (failed on all placements).
+ *
+ * The function returns affectedTupleCount if applicable.
  */
-static void
+static int64
 ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTasks,
 						bool expectResults)
 {
@@ -924,15 +928,12 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 	/* if some placements failed, ensure future statements don't access them */
 	MarkFailedShardPlacements();
 
-	if (executorState)
-	{
-		executorState->es_processed += affectedTupleCount;
-	}
-
 	if (IsTransactionBlock())
 	{
 		XactModificationLevel = XACT_MODIFICATION_DATA;
 	}
+
+	return affectedTupleCount;
 }
 
 
@@ -1060,25 +1061,32 @@ ExecuteModifyTasksWithoutResults(List *taskList)
 
 
 /*
- * ExecuteDDLTasksSequentiallyWithoutResults basically calls ExecuteSingleModifyTask in
+ * ExecuteModifyTasksSequentiallyWithoutResults basically calls ExecuteSingleModifyTask in
  * a loop in order to simulate sequential execution of a list of tasks. Useful
  * in cases where issuing commands in parallel before waiting for results could
  * result in deadlocks (such as CREATE INDEX CONCURRENTLY or foreign key creation to
  * reference tables).
+ *
+ * The function returns the affectedTupleCount if applicable. Otherwise, the function
+ * returns 0.
  */
-void
-ExecuteDDLTasksSequentiallyWithoutResults(List *taskList)
+int64
+ExecuteModifyTasksSequentiallyWithoutResults(List *taskList)
 {
 	ListCell *taskCell = NULL;
 	bool multipleTasks = list_length(taskList) > 1;
 	bool expectResults = false;
+	int64 affectedTupleCount = 0;
 
 	foreach(taskCell, taskList)
 	{
 		Task *task = (Task *) lfirst(taskCell);
 
-		ExecuteSingleModifyTask(NULL, task, multipleTasks, expectResults);
+		affectedTupleCount +=
+			ExecuteSingleModifyTask(NULL, task, multipleTasks, expectResults);
 	}
+
+	return affectedTupleCount;
 }
 
 
