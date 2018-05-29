@@ -771,7 +771,7 @@ ExecuteSingleModifyTask(CitusScanState *scanState, Task *task, bool multipleTask
 		failOnError = true;
 	}
 
-	if (task->taskType == MODIFY_TASK)
+	if (scanState)
 	{
 		operation = scanState->distributedPlan->operation;
 		executorState = scanState->customScanState.ss.ps.state;
