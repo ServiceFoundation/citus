@@ -409,6 +409,9 @@ SELECT *
 	FROM articles_hash_mx
 	WHERE author_id = (random()::int  * 0 + 1);
 
+-- SELECT ... FOR UPDATE does not supported from MX nodes
+SELECT * FROM articles_hash_mx WHERE author_id = 10 AND id = 50 FOR UPDATE;
+
 -- not router plannable due to or
 SELECT *
 	FROM articles_hash_mx

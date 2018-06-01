@@ -139,7 +139,7 @@ static List * ExtractInsertValuesList(Query *query, Var *partitionColumn);
 static bool MultiRouterPlannableQuery(Query *query,
 									  RelationRestrictionContext *restrictionContext);
 static DeferredErrorMessage * ErrorIfQueryHasModifyingCTE(Query *queryTree);
-static RangeTblEntry * GetUpdateOrDeleteRTE(List *rangeTableList);
+static RangeTblEntry * GetUpdateOrDeleteRTE(Query *query);
 static bool UpdateOrDeleteRTE(RangeTblEntry *rangeTableEntry);
 static bool SelectsFromDistributedTable(List *rangeTableList);
 #if (PG_VERSION_NUM >= 100000)
@@ -150,6 +150,7 @@ static int CompareInsertValuesByShardId(const void *leftElement,
 static uint64 GetInitialShardId(List *relationShardList);
 static List * SingleShardSelectTaskList(Query *query, List *relationShardList,
 										List *placementList, uint64 shardId);
+static bool RowLocksOnRelations(Node *node, List **rtiLockList);
 static List * SingleShardModifyTaskList(Query *query, List *relationShardList,
 										List *placementList, uint64 shardId);
 
@@ -1490,6 +1491,7 @@ CreateTask(TaskType taskType)
 	task->taskExecution = NULL;
 	task->upsertQuery = false;
 	task->replicationModel = REPLICATION_MODEL_INVALID;
+	task->relationRowLockList = NIL;
 
 	task->modifyWithSubquery = false;
 	task->relationShardList = NIL;
@@ -1540,7 +1542,6 @@ RouterJob(Query *originalQuery, PlannerRestrictionContext *plannerRestrictionCon
 	uint64 shardId = INVALID_SHARD_ID;
 	List *placementList = NIL;
 	List *relationShardList = NIL;
-	List *rangeTableList = NIL;
 	bool replacePrunedQueryWithDummy = false;
 	bool requiresMasterEvaluation = false;
 	RangeTblEntry *updateOrDeleteRTE = NULL;
@@ -1566,8 +1567,7 @@ RouterJob(Query *originalQuery, PlannerRestrictionContext *plannerRestrictionCon
 	job = CreateJob(originalQuery);
 	job->partitionValueConst = partitionValueConst;
 
-	ExtractRangeTableEntryWalker((Node *) originalQuery, &rangeTableList);
-	updateOrDeleteRTE = GetUpdateOrDeleteRTE(rangeTableList);
+	updateOrDeleteRTE = GetUpdateOrDeleteRTE(originalQuery);
 
 	/*
 	 * If all of the shards are pruned, we replace the relation RTE into
@@ -1616,15 +1616,59 @@ SingleShardSelectTaskList(Query *query, List *relationShardList, List *placement
 {
 	Task *task = CreateTask(ROUTER_TASK);
 	StringInfo queryString = makeStringInfo();
+	List *relationRowLockList = NIL;
 
+	RowLocksOnRelations((Node *) query, &relationRowLockList);
 	pg_get_query_def(query, queryString);
 
 	task->queryString = queryString->data;
 	task->anchorShardId = shardId;
 	task->taskPlacementList = placementList;
 	task->relationShardList = relationShardList;
+	task->relationRowLockList = relationRowLockList;
 
 	return list_make1(task);
+}
+
+
+/*
+ * RowLocksOnRelations forms the list for range table IDs and corresponding
+ * row lock modes.
+ */
+static bool
+RowLocksOnRelations(Node *node, List **relationRowLockList)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+		ListCell *rowMarkCell = NULL;
+
+		foreach(rowMarkCell, query->rowMarks)
+		{
+			RowMarkClause *rowMarkClause = (RowMarkClause *) lfirst(rowMarkCell);
+			RangeTblEntry *rangeTable = rt_fetch(rowMarkClause->rti, query->rtable);
+			Oid relationId = rangeTable->relid;
+
+			if (IsDistributedTable(relationId))
+			{
+				RelationRowLock *relationRowLock = CitusMakeNode(RelationRowLock);
+				relationRowLock->relationId = relationId;
+				relationRowLock->rowLockStrength = rowMarkClause->strength;
+				*relationRowLockList = lappend(*relationRowLockList, relationRowLock);
+			}
+		}
+
+		return query_tree_walker(query, RowLocksOnRelations, relationRowLockList, 0);
+	}
+	else
+	{
+		return expression_tree_walker(node, RowLocksOnRelations, relationRowLockList);
+	}
 }
 
 
@@ -1644,7 +1688,7 @@ SingleShardModifyTaskList(Query *query, List *relationShardList, List *placement
 	RangeTblEntry *updateOrDeleteRTE = NULL;
 
 	ExtractRangeTableEntryWalker((Node *) query, &rangeTableList);
-	updateOrDeleteRTE = GetUpdateOrDeleteRTE(rangeTableList);
+	updateOrDeleteRTE = GetUpdateOrDeleteRTE(query);
 
 	modificationTableCacheEntry = DistributedTableCacheEntry(updateOrDeleteRTE->relid);
 	modificationPartitionMethod = modificationTableCacheEntry->partitionMethod;
@@ -1670,22 +1714,15 @@ SingleShardModifyTaskList(Query *query, List *relationShardList, List *placement
 
 
 /*
- * GetUpdateOrDeleteRTE walks over the given range table list, and checks if
- * it has an UPDATE or DELETE RTE. If it finds one, it return it immediately.
+ * GetUpdateOrDeleteRTE checks query if it has an UPDATE or DELETE RTE. If it finds
+ * it returns it.
  */
 static RangeTblEntry *
-GetUpdateOrDeleteRTE(List *rangeTableList)
+GetUpdateOrDeleteRTE(Query *query)
 {
-	ListCell *rangeTableCell = NULL;
-
-	foreach(rangeTableCell, rangeTableList)
+	if (query->resultRelation > 0)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-
-		if (UpdateOrDeleteRTE(rangeTableEntry))
-		{
-			return rangeTableEntry;
-		}
+		return rt_fetch(query->resultRelation, query->rtable);
 	}
 
 	return NULL;
@@ -2740,11 +2777,6 @@ MultiRouterPlannableQuery(Query *query, RelationRestrictionContext *restrictionC
 		return false;
 	}
 
-	if (query->hasForUpdate)
-	{
-		return false;
-	}
-
 	foreach(relationRestrictionContextCell, restrictionContext->relationRestrictionList)
 	{
 		RelationRestriction *relationRestriction =
@@ -2767,6 +2799,24 @@ MultiRouterPlannableQuery(Query *query, RelationRestrictionContext *restrictionC
 				  DISTRIBUTE_BY_NONE || partitionMethod == DISTRIBUTE_BY_RANGE))
 			{
 				return false;
+			}
+
+			/*
+			 * Currently, we don't support tables with replication factor > 1,
+			 * except reference tables with SELECT ... FOR UDPATE queries. It is
+			 * also not supported from MX nodes.
+			 */
+			if (query->hasForUpdate)
+			{
+				uint32 tableReplicationFactor = TableShardReplicationFactor(
+					distributedTableId);
+
+				EnsureCoordinator();
+
+				if (tableReplicationFactor > 1 && partitionMethod != DISTRIBUTE_BY_NONE)
+				{
+					return false;
+				}
 			}
 		}
 	}
