@@ -140,8 +140,7 @@ static bool MultiRouterPlannableQuery(Query *query,
 									  RelationRestrictionContext *restrictionContext);
 static DeferredErrorMessage * ErrorIfQueryHasModifyingCTE(Query *queryTree);
 static RangeTblEntry * GetUpdateOrDeleteRTE(Query *query);
-static bool UpdateOrDeleteRTE(RangeTblEntry *rangeTableEntry);
-static bool SelectsFromDistributedTable(List *rangeTableList);
+static bool SelectsFromDistributedTable(List *rangeTableList, Query *query);
 #if (PG_VERSION_NUM >= 100000)
 static List * get_all_actual_clauses(List *restrictinfo_list);
 #endif
@@ -1694,7 +1693,7 @@ SingleShardModifyTaskList(Query *query, List *relationShardList, List *placement
 	modificationPartitionMethod = modificationTableCacheEntry->partitionMethod;
 
 	if (modificationPartitionMethod == DISTRIBUTE_BY_NONE &&
-		SelectsFromDistributedTable(rangeTableList))
+		SelectsFromDistributedTable(rangeTableList, query))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot perform select on a distributed table "
@@ -1730,32 +1729,21 @@ GetUpdateOrDeleteRTE(Query *query)
 
 
 /*
- * UpdateOrDeleteRTE checks if the given range table entry is an UPDATE or
- * DELETE RTE by checking required permissions on it.
- */
-static bool
-UpdateOrDeleteRTE(RangeTblEntry *rangeTableEntry)
-{
-	if ((ACL_UPDATE & rangeTableEntry->requiredPerms) ||
-		(ACL_DELETE & rangeTableEntry->requiredPerms))
-	{
-		return true;
-	}
-	else
-	{
-		return false;
-	}
-}
-
-
-/*
  * SelectsFromDistributedTable checks if there is a select on a distributed
  * table by looking into range table entries.
  */
 static bool
-SelectsFromDistributedTable(List *rangeTableList)
+SelectsFromDistributedTable(List *rangeTableList, Query *query)
 {
 	ListCell *rangeTableCell = NULL;
+	int resultRelation = query->resultRelation;
+	RangeTblEntry *resultRangeTableEntry = NULL;
+
+	if (resultRelation > 0)
+	{
+		resultRangeTableEntry = rt_fetch(resultRelation, query->rtable);
+	}
+
 	foreach(rangeTableCell, rangeTableList)
 	{
 		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
@@ -1768,7 +1756,7 @@ SelectsFromDistributedTable(List *rangeTableList)
 
 		cacheEntry = DistributedTableCacheEntry(rangeTableEntry->relid);
 		if (cacheEntry->partitionMethod != DISTRIBUTE_BY_NONE &&
-			!UpdateOrDeleteRTE(rangeTableEntry))
+			(resultRangeTableEntry == NULL || resultRangeTableEntry->relid != rangeTableEntry->relid))
 		{
 			return true;
 		}
