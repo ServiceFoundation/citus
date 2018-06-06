@@ -8,7 +8,7 @@ SELECT (run_command_on_workers($$
       count(tc.constraint_name)
   FROM
       information_schema.table_constraints AS tc
-  WHERE constraint_type = 'FOREIGN KEY' AND tc.constraint_name LIKE 'fkey_ref%'
+  WHERE constraint_type = 'FOREIGN KEY' AND tc.constraint_name LIKE '%fkey%' AND table_schema = 'fkey_reference_table'
 $$)).*;
 
 CREATE TABLE referenced_table(id int UNIQUE, test_column int);
@@ -18,17 +18,16 @@ SELECT create_reference_table('referenced_table');
 -- All should fail
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON DELETE SET NULL;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON DELETE SET NULL;
+DROP TABLE referencing_table;
+
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON DELETE SET DEFAULT);
+SELECT create_distributed_table('referencing_table', 'ref_id');
 DROP TABLE referencing_table;
 
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON DELETE SET DEFAULT;
-DROP TABLE referencing_table;
-
-CREATE TABLE referencing_table(id int, ref_id int);
-SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON UPDATE SET NULL;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(ref_id) REFERENCES referenced_table(id) ON UPDATE SET NULL;
 DROP TABLE referencing_table;
 
 -- try with multiple columns including the distribution column
@@ -38,12 +37,11 @@ SELECT create_reference_table('referenced_table');
 
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id, ref_id) REFERENCES referenced_table(id, test_column) ON UPDATE SET DEFAULT;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(id, ref_id) REFERENCES referenced_table(id, test_column) ON UPDATE SET DEFAULT;
 DROP TABLE referencing_table;
 
-CREATE TABLE referencing_table(id int, ref_id int);
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY(id, ref_id) REFERENCES referenced_table(id, test_column) ON UPDATE CASCADE);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id, ref_id) REFERENCES referenced_table(id, test_column) ON UPDATE CASCADE;
 DROP TABLE referencing_table;
 
 -- all of the above is supported if the foreign key does not include distribution column
@@ -53,39 +51,36 @@ SELECT create_reference_table('referenced_table');
 
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id) REFERENCES referenced_table(id) ON DELETE SET NULL;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(id) REFERENCES referenced_table(id) ON DELETE SET NULL;
 SELECT * FROM num_of_foreign_keys;
 DROP TABLE referencing_table;
 
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id) REFERENCES referenced_table(id) ON DELETE SET DEFAULT;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(id) REFERENCES referenced_table(id) ON DELETE SET DEFAULT;
+SELECT * FROM num_of_foreign_keys;
+DROP TABLE referencing_table;
+
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE SET NULL);
+SELECT create_distributed_table('referencing_table', 'ref_id');
 SELECT * FROM num_of_foreign_keys;
 DROP TABLE referencing_table;
 
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE SET NULL;
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE SET DEFAULT;
 SELECT * FROM num_of_foreign_keys;
 DROP TABLE referencing_table;
 
-CREATE TABLE referencing_table(id int, ref_id int);
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE CASCADE);
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE SET DEFAULT;
-SELECT * FROM num_of_foreign_keys;
-DROP TABLE referencing_table;
-
-CREATE TABLE referencing_table(id int, ref_id int);
-SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY(id) REFERENCES referenced_table(id) ON UPDATE CASCADE;
 SELECT * FROM num_of_foreign_keys;
 DROP TABLE referencing_table;
 
 -- foreign keys are only supported when the replication factor = 1
 SET citus.shard_replication_factor TO 2;
-CREATE TABLE referencing_table(id int, ref_id int);
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY (id) REFERENCES referenced_table(id));
 SELECT create_distributed_table('referencing_table', 'ref_id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (id) REFERENCES referenced_table(id);
 SELECT * FROM num_of_foreign_keys;
 DROP TABLE referencing_table;
 DROP TABLE referenced_table;
@@ -96,7 +91,7 @@ CREATE TABLE referenced_table(id int UNIQUE, test_column int, PRIMARY KEY(id, te
 CREATE TABLE referencing_table(id int, ref_id int);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (ref_id) REFERENCES referenced_table(id);
+ALTER TABLE referencing_table ADD CONSTRAINT fkey FOREIGN KEY (ref_id) REFERENCES referenced_table(id);
 
 
 -- test inserts
@@ -158,10 +153,9 @@ DROP SCHEMA referencing_schema CASCADE;
 
 -- on delete set update cascades properly
 CREATE TABLE referenced_table(test_column int, test_column2 int, PRIMARY KEY(test_column));
-CREATE TABLE referencing_table(id int, ref_id int DEFAULT -1);
+CREATE TABLE referencing_table(id int, ref_id int DEFAULT -1, FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON DELETE SET DEFAULT);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON DELETE SET DEFAULT;
 
 INSERT INTO referenced_table SELECT x, x+1 FROM generate_series(1,1000) AS f(x);
 INSERT INTO referencing_table SELECT x, x+1 FROM generate_series(1,999) AS f(x);
@@ -178,10 +172,9 @@ CREATE TYPE composite AS (key1 int, key2 int);
 SELECT run_command_on_workers($$CREATE TYPE fkey_reference_table.composite AS (key1 int, key2 int)$$);
 
 CREATE TABLE referenced_table(test_column composite, PRIMARY KEY(test_column));
-CREATE TABLE referencing_table(id int, referencing_composite composite);
+CREATE TABLE referencing_table(id int, referencing_composite composite, FOREIGN KEY (referencing_composite) REFERENCES referenced_table(test_column) ON DELETE CASCADE);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (referencing_composite) REFERENCES referenced_table(test_column) ON DELETE CASCADE;
 
 INSERT INTO referenced_table SELECT (x, x+1)::composite FROM generate_series(1,1000) AS f(x);
 INSERT INTO referencing_table SELECT x, (x+1, x+2)::composite FROM generate_series(1,999) AS f(x);
@@ -210,10 +203,9 @@ DROP TABLE referencing_table CASCADE;
 
 -- Serial column type works properly when it is in the source of foreign constraint
 CREATE TABLE referenced_table(test_column int PRIMARY KEY, test_column2 int);
-CREATE TABLE referencing_table(id int, ref_id SERIAL);
+CREATE TABLE referencing_table(id int, ref_id SERIAL, FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON DELETE CASCADE);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON DELETE CASCADE;
 
 INSERT INTO referenced_table SELECT x,x%20 FROM generate_series(1,1000) AS f(x);
 -- Success for existing inserts
@@ -275,10 +267,9 @@ DROP TABLE referencing_table CASCADE;
 
 -- UPSERT on update set cascading
 CREATE TABLE referenced_table(test_column int, test_column2 int, PRIMARY KEY(test_column));
-CREATE TABLE referencing_table(id int, ref_id int DEFAULT -1);
+CREATE TABLE referencing_table(id int, ref_id int DEFAULT -1, FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON UPDATE CASCADE);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (ref_id) REFERENCES referenced_table(test_column) ON UPDATE CASCADE;
 
 INSERT INTO referenced_table SELECT x, x+1 FROM generate_series(0,1000) AS f(x);
 INSERT INTO referencing_table SELECT x, x+1 FROM generate_series(0,999) AS f(x);
@@ -331,12 +322,10 @@ DROP TABLE referencing_table CASCADE;
 -- one is the distribution key one is not
 CREATE TABLE referenced_table(test_column int, test_column2 int, PRIMARY KEY(test_column));
 CREATE TABLE referenced_table2(test_column int, test_column2 int, PRIMARY KEY(test_column2));
-CREATE TABLE referencing_table(id int, ref_id int);
+CREATE TABLE referencing_table(id int, ref_id int, FOREIGN KEY (id) REFERENCES referenced_table(test_column) ON DELETE CASCADE, FOREIGN KEY (ref_id) REFERENCES referenced_table2(test_column2) ON DELETE CASCADE);
 SELECT create_reference_table('referenced_table');
 SELECT create_reference_table('referenced_table2');
 SELECT create_distributed_table('referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (id) REFERENCES referenced_table(test_column) ON DELETE CASCADE;
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref2 FOREIGN KEY (ref_id) REFERENCES referenced_table2(test_column2) ON DELETE CASCADE;
 
 INSERT INTO referenced_table SELECT x, x+1 FROM generate_series(0,1000) AS f(x);
 INSERT INTO referenced_table2 SELECT x, x+1 FROM generate_series(500,1500) AS f(x);
@@ -399,12 +388,11 @@ DROP TABLE referencing_table2 CASCADE;
 
 -- on delete cascade with multi column FK in form of reference table <= distributed table <= distributed table
 CREATE TABLE referenced_table(test_column int, test_column2 int, PRIMARY KEY(test_column, test_column2));
-CREATE TABLE referencing_table(id int, ref_id int, ref_id2 int, PRIMARY KEY(id, ref_id));
+CREATE TABLE referencing_table(id int, ref_id int, ref_id2 int, PRIMARY KEY(id, ref_id), FOREIGN KEY (ref_id, ref_id2) REFERENCES referenced_table(test_column, test_column2) ON DELETE CASCADE);
 CREATE TABLE referencing_referencing_table(id int, ref_id int, FOREIGN KEY (id, ref_id) REFERENCES referencing_table(id, ref_id) ON DELETE CASCADE);
 SELECT create_reference_table('referenced_table');
 SELECT create_distributed_table('referencing_table', 'id');
 SELECT create_distributed_table('referencing_referencing_table', 'id');
-ALTER TABLE referencing_table ADD CONSTRAINT fkey_ref FOREIGN KEY (ref_id, ref_id2) REFERENCES referenced_table(test_column, test_column2) ON DELETE CASCADE;
 
 INSERT INTO referenced_table SELECT x, x+1 FROM generate_series(1,1000) AS f(x);
 INSERT INTO referencing_table SELECT x, x+1, x+2 FROM generate_series(1,999) AS f(x);

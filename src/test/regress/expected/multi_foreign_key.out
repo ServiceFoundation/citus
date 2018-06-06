@@ -867,7 +867,8 @@ ALTER TABLE reference_table_second ADD CONSTRAINT fk FOREIGN KEY(referencing_col
 ERROR:  cannot create foreign key constraint from reference tables
 DETAIL:  Reference tables can only be on the referenced side of a foreign key from a hash distributed table
 -- test foreign key creation on ALTER TABLE from reference table to local table
-DROP TABLE reference_table;
+DROP TABLE reference_table CASCADE;
+NOTICE:  drop cascades to constraint fk on table references_to_reference_table
 CREATE TABLE reference_table(id int PRIMARY KEY, referencing_column int);
 SELECT create_reference_table('reference_table');
  create_reference_table 
